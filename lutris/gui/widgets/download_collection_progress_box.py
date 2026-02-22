@@ -129,7 +129,10 @@ class DownloadCollectionProgressBox(Gtk.Box):
         self.update_download_file_label(file.filename)
         if not self.downloader:
             try:
-                self.downloader = Downloader(file.url, file.tmp_file, referer=file.referer, overwrite=True)
+                # Use custom downloader class if the file specifies one
+                # (e.g., GOGDownloader for parallel multi-connection downloads)
+                downloader_cls = getattr(file, "downloader_class", None) or Downloader
+                self.downloader = downloader_cls(file.url, file.tmp_file, referer=file.referer, overwrite=True)
             except RuntimeError as ex:
                 display_error(ex, parent=self.get_toplevel())
                 self.emit("cancel")
