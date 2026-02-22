@@ -20,6 +20,7 @@ from requests.adapters import HTTPAdapter
 
 from lutris import __version__
 from lutris.util import jobs
+from lutris.util.download_progress import DownloadProgress
 from lutris.util.downloader import DEFAULT_CHUNK_SIZE, Downloader, get_time
 from lutris.util.log import logger
 
@@ -65,6 +66,7 @@ class GOGDownloader(Downloader):
         )
         self.num_workers = max(1, num_workers)
         self._download_lock = threading.Lock()
+        self._progress: Optional[DownloadProgress] = None
         # Create a dedicated session with connection pooling sized for our workers
         self._parallel_session = requests.Session()
         adapter = HTTPAdapter(pool_maxsize=self.num_workers + 2)
@@ -76,19 +78,50 @@ class GOGDownloader(Downloader):
         return "GOG parallel downloader (%d workers) for %s" % (self.num_workers, self.url)
 
     def start(self):
-        """Start parallel download job."""
+        """Start parallel download job.
+
+        If a previous download was interrupted (hibernate, crash, network
+        error), the progress file and partial destination file are detected
+        and the download resumes from the last completed byte ranges
+        instead of starting over.
+        """
         logger.debug("⬇ GOG parallel (%d workers): %s", self.num_workers, self.url)
         self.state = self.DOWNLOADING
         self.last_check_time = get_time()
-        if self.overwrite and os.path.isfile(self.dest):
+
+        # Check for resumable progress before deleting anything
+        can_resume = False
+        if os.path.isfile(self.dest):
+            progress = DownloadProgress(self.dest)
+            if progress.load() and progress.get_remaining_ranges():
+                can_resume = True
+                logger.info(
+                    "GOG download: found resumable progress for %s "
+                    "(%d/%d ranges complete, %d bytes already downloaded)",
+                    os.path.basename(self.dest),
+                    len(progress.completed_ranges),
+                    len(progress.total_ranges),
+                    progress.get_completed_size(),
+                )
+
+        if not can_resume and self.overwrite and os.path.isfile(self.dest):
             os.remove(self.dest)
+            # Also clean stale progress files
+            progress_path = DownloadProgress.progress_path_for(self.dest)
+            if os.path.isfile(progress_path):
+                os.remove(progress_path)
+
         # Workers manage their own file I/O - no shared file_pointer needed
         self.file_pointer = None
         self.thread = jobs.AsyncCall(self.async_download, None)
         self.stop_request = self.thread.stop_request
 
     def cancel(self):
-        """Request download stop and remove destination file."""
+        """Request download stop and remove destination file.
+
+        Explicit user cancellation removes both the partial file and
+        the progress file so the next attempt starts fresh.
+        """
         logger.debug("❌ GOG parallel: %s", self.url)
         self.state = self.CANCELLED
         if self.stop_request:
@@ -96,9 +129,13 @@ class GOGDownloader(Downloader):
         # No shared file_pointer to close - workers handle their own
         if os.path.isfile(self.dest):
             os.remove(self.dest)
+        # Clean up progress file on explicit cancel
+        if self._progress:
+            self._progress.cleanup()
+            self._progress = None
 
     def on_download_completed(self):
-        """Mark download as complete."""
+        """Mark download as complete and clean up progress file."""
         if self.state == self.CANCELLED:
             return
         logger.debug("✅ GOG parallel download finished: %s", self.url)
@@ -109,10 +146,14 @@ class GOGDownloader(Downloader):
             self.progress_percentage = 100
         self.state = self.COMPLETED
         # No shared file_pointer to close
+        # Remove progress file — download is complete
+        if self._progress:
+            self._progress.cleanup()
+            self._progress = None
 
-    def _build_request_headers(self) -> dict:
+    def _build_request_headers(self) -> Dict[str, str]:
         """Build HTTP headers for download requests."""
-        headers = requests.utils.default_headers()
+        headers: Dict[str, str] = dict(requests.utils.default_headers())
         headers["User-Agent"] = "Lutris/%s" % __version__
         if self.referer:
             headers["Referer"] = self.referer
@@ -135,7 +176,19 @@ class GOGDownloader(Downloader):
         return ranges
 
     def async_download(self):
-        """Execute multi-connection parallel download."""
+        """Execute multi-connection parallel download with resume support.
+
+        On each invocation the method:
+        1. Probes the server for the final URL, file size, and Range support.
+        2. Checks for an existing ``.progress`` file alongside the
+           destination.  If one is found and the file size matches, the
+           download resumes from only the remaining byte ranges.
+        3. Pre-allocates (or reuses) the destination file and launches
+           parallel workers for the outstanding ranges.
+        4. On success the progress file is removed.  On failure or
+           interruption (hibernate, crash) the progress file and partial
+           destination are preserved for the next attempt.
+        """
         try:
             headers = self._build_request_headers()
 
@@ -146,8 +199,7 @@ class GOGDownloader(Downloader):
             # Fall back to single-stream if Range not supported or file too small
             if not supports_range or file_size < self.MIN_CHUNK_SIZE * 2:
                 logger.info(
-                    "GOG download: falling back to single-stream "
-                    "(range=%s, size=%d bytes)",
+                    "GOG download: falling back to single-stream (range=%s, size=%d bytes)",
                     supports_range,
                     file_size,
                 )
@@ -156,28 +208,72 @@ class GOGDownloader(Downloader):
 
             self.progress_event.set()  # Signal that size is known
 
-            # Step 2: Pre-allocate output file
-            with open(self.dest, "wb") as f:
-                f.truncate(file_size)
+            # Step 2: Check for resumable progress
+            self._progress = DownloadProgress(self.dest)
+            ranges_to_download = None
 
-            # Step 3: Calculate byte ranges for workers
-            ranges = self._calculate_ranges(file_size)
-            per_worker_mb = (file_size // self.num_workers) // (1024 * 1024)
+            if self._progress.load() and self._progress.is_compatible(file_size):
+                remaining = self._progress.get_remaining_ranges()
+                if remaining:
+                    already_done = self._progress.get_completed_size()
+                    logger.info(
+                        "GOG download: resuming — %d/%d ranges done, %d bytes already on disk, %d bytes remaining",
+                        len(self._progress.completed_ranges),
+                        len(self._progress.total_ranges),
+                        already_done,
+                        file_size - already_done,
+                    )
+                    # Credit previously-downloaded bytes to progress tracking
+                    with self._download_lock:
+                        self.downloaded_size = already_done
+                    ranges_to_download = remaining
+                else:
+                    # All ranges already complete — verify file exists & size
+                    if os.path.isfile(self.dest) and os.path.getsize(self.dest) == file_size:
+                        logger.info(
+                            "GOG download: all ranges already complete, skipping download of %s",
+                            os.path.basename(self.dest),
+                        )
+                        with self._download_lock:
+                            self.downloaded_size = file_size
+                        self.on_download_completed()
+                        return
+
+            # Step 3: Compute ranges (fresh or from progress)
+            if ranges_to_download is None:
+                # Fresh download — pre-allocate output file
+                with open(self.dest, "wb") as f:
+                    f.truncate(file_size)
+                all_ranges = self._calculate_ranges(file_size)
+                self._progress.create(final_url, file_size, all_ranges)
+                ranges_to_download = all_ranges
+            else:
+                # Resuming — verify dest file exists and has correct size
+                if not os.path.isfile(self.dest) or os.path.getsize(self.dest) != file_size:
+                    logger.warning("GOG download: dest file missing or wrong size during resume, starting fresh")
+                    with open(self.dest, "wb") as f:
+                        f.truncate(file_size)
+                    all_ranges = self._calculate_ranges(file_size)
+                    self._progress.create(final_url, file_size, all_ranges)
+                    ranges_to_download = all_ranges
+                    with self._download_lock:
+                        self.downloaded_size = 0
+
+            total_remaining = sum(e - s + 1 for s, e in ranges_to_download)
             logger.info(
-                "GOG parallel download: %d workers, %d MB total, ~%d MB/worker",
+                "GOG parallel download: %d workers, %d ranges to download, %d MB remaining of %d MB total",
                 self.num_workers,
+                len(ranges_to_download),
+                total_remaining // (1024 * 1024),
                 file_size // (1024 * 1024),
-                per_worker_mb,
             )
 
             # Step 4: Download chunks in parallel
             errors = []
             with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
                 future_to_range = {}
-                for start, end in ranges:
-                    future = executor.submit(
-                        self._download_range, final_url, headers, start, end
-                    )
+                for start, end in ranges_to_download:
+                    future = executor.submit(self._download_range, final_url, headers, start, end)
                     future_to_range[future] = (start, end)
 
                 for future in as_completed(future_to_range):
@@ -185,9 +281,7 @@ class GOGDownloader(Downloader):
                         future.result()
                     except Exception as ex:
                         rng = future_to_range[future]
-                        logger.error(
-                            "Worker failed for range %d-%d: %s", rng[0], rng[1], ex
-                        )
+                        logger.error("Worker failed for range %d-%d: %s", rng[0], rng[1], ex)
                         errors.append(ex)
                         # Signal other workers to stop
                         if self.stop_request:
@@ -238,9 +332,7 @@ class GOGDownloader(Downloader):
         try:
             test_headers = dict(headers)
             test_headers["Range"] = "bytes=0-0"
-            resp = self._parallel_session.get(
-                url, headers=test_headers, stream=True, timeout=10, cookies=self.cookies
-            )
+            resp = self._parallel_session.get(url, headers=test_headers, stream=True, timeout=10, cookies=self.cookies)
             resp.close()
             return resp.status_code == 206
         except Exception:
@@ -277,12 +369,13 @@ class GOGDownloader(Downloader):
                 # If server returned 200 (ignoring Range), only write our portion
                 if response.status_code == 200:
                     logger.warning(
-                        "Server ignored Range header, reading full response "
-                        "for range %d-%d",
+                        "Server ignored Range header, reading full response for range %d-%d",
                         start,
                         end,
                     )
                     self._write_from_full_response(response, start, end)
+                    if self._progress:
+                        self._progress.mark_range_complete(start, end)
                     return
 
                 # Normal 206 Partial Content response
@@ -296,6 +389,10 @@ class GOGDownloader(Downloader):
                             with self._download_lock:
                                 self.downloaded_size += len(chunk)
                             self.progress_event.set()
+
+                # Mark this range as complete in the progress file
+                if self._progress:
+                    self._progress.mark_range_complete(start, end)
                 return  # Success
 
             except Exception as ex:
@@ -316,16 +413,13 @@ class GOGDownloader(Downloader):
                 else:
                     raise
 
-    def _write_from_full_response(
-        self, response: requests.Response, start: int, end: int
-    ) -> None:
+    def _write_from_full_response(self, response: requests.Response, start: int, end: int) -> None:
         """Handle the case where server returns 200 instead of 206.
 
         Read the full response but only write our byte range portion.
         This is a fallback for non-compliant servers.
         """
         bytes_read = 0
-        expected_size = end - start + 1
         with open(self.dest, "r+b") as f:
             f.seek(start)
             for chunk in response.iter_content(chunk_size=self.chunk_size):
@@ -364,9 +458,7 @@ class GOGDownloader(Downloader):
 
         Uses the parallel session for connection pooling benefits.
         """
-        response = self._parallel_session.get(
-            url, headers=headers, stream=True, timeout=30, cookies=self.cookies
-        )
+        response = self._parallel_session.get(url, headers=headers, stream=True, timeout=30, cookies=self.cookies)
         response.raise_for_status()
         self.full_size = int(response.headers.get("Content-Length", "").strip() or 0)
         self.progress_event.set()

@@ -3,13 +3,13 @@
 import os
 import threading
 import time
-from concurrent.futures import Future
-from unittest.mock import MagicMock, Mock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from lutris.util.gog_downloader import GOGDownloader
+from lutris.util.download_progress import DownloadProgress
 from lutris.util.downloader import DEFAULT_CHUNK_SIZE, Downloader
+from lutris.util.gog_downloader import GOGDownloader
 
 
 class TestGOGDownloaderInit:
@@ -76,9 +76,7 @@ class TestBuildRequestHeaders:
         assert "Lutris/" in headers["User-Agent"]
 
     def test_referer_header(self):
-        dl = GOGDownloader(
-            "https://example.com/file.bin", "/tmp/test.bin", referer="https://gog.com"
-        )
+        dl = GOGDownloader("https://example.com/file.bin", "/tmp/test.bin", referer="https://gog.com")
         headers = dl._build_request_headers()
         assert headers["Referer"] == "https://gog.com"
 
@@ -132,7 +130,7 @@ class TestCalculateRanges:
         dl = GOGDownloader("https://example.com/file.bin", "/tmp/test.bin", num_workers=5)
         ranges = dl._calculate_ranges(123456)
         for i in range(len(ranges) - 1):
-            assert ranges[i][1] + 1 == ranges[i + 1][0], f"Gap between range {i} and {i+1}"
+            assert ranges[i][1] + 1 == ranges[i + 1][0], f"Gap between range {i} and {i + 1}"
 
 
 class TestProbeServer:
@@ -393,9 +391,7 @@ class TestDownloadRange:
         mock_resp_ok.iter_content = MagicMock(return_value=[chunk_data])
 
         # Fail twice, succeed on third attempt
-        with patch.object(
-            dl._parallel_session, "get", side_effect=[mock_resp_fail, mock_resp_fail, mock_resp_ok]
-        ):
+        with patch.object(dl._parallel_session, "get", side_effect=[mock_resp_fail, mock_resp_fail, mock_resp_ok]):
             dl._download_range("https://cdn.gog.com/file.bin", {}, 0, 99)
 
         assert dl.downloaded_size == 100
@@ -476,6 +472,7 @@ class TestInstallerFileIntegration:
         """Ensure GTK version is required before importing InstallerFile."""
         try:
             import gi
+
             gi.require_version("Gtk", "3.0")
             gi.require_version("Gdk", "3.0")
         except (ValueError, ImportError):
@@ -530,6 +527,7 @@ class TestGOGServiceIntegration:
         """Ensure GTK version is required before importing GOG service."""
         try:
             import gi
+
             gi.require_version("Gtk", "3.0")
             gi.require_version("Gdk", "3.0")
         except (ValueError, ImportError):
@@ -594,3 +592,409 @@ class TestProgressTracking:
 
         progress = dl.check_progress()
         assert 0.4 <= progress <= 0.6  # Approximately 50%
+
+
+# ==================================================================
+# Phase 3: Download resume tests
+# ==================================================================
+
+
+class TestResumeProgressCreation:
+    """Test that parallel downloads create progress files."""
+
+    def test_fresh_download_creates_progress_file(self, tmp_path):
+        """A parallel download should create a .progress sidecar file."""
+        dest = str(tmp_path / "fresh.bin")
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=2)
+
+        file_size = 2000
+        data = b"X" * file_size
+
+        mock_head_resp = MagicMock()
+        mock_head_resp.url = "https://cdn.gog.com/file.bin"
+        mock_head_resp.headers = {
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        }
+        mock_head_resp.raise_for_status = MagicMock()
+
+        def mock_get(url, headers=None, stream=None, timeout=None, cookies=None):
+            resp = MagicMock()
+            rng = headers.get("Range", "")
+            parts = rng.replace("bytes=", "").split("-")
+            start, end = int(parts[0]), int(parts[1])
+            resp.status_code = 206
+            resp.iter_content = MagicMock(return_value=[data[start : end + 1]])
+            return resp
+
+        dl.stop_request = threading.Event()
+        dl.MIN_CHUNK_SIZE = 100
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head_resp):
+            with patch.object(dl._parallel_session, "get", side_effect=mock_get):
+                dl.async_download()
+
+        assert dl.state == dl.COMPLETED
+        # Progress file should be cleaned up on success
+        assert not os.path.exists(dest + ".progress")
+
+    def test_progress_file_records_completed_ranges(self, tmp_path):
+        """Ranges that finish should be persisted in the progress file."""
+        dest = str(tmp_path / "track.bin")
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=2)
+
+        file_size = 2000
+        data = b"A" * 1000 + b"B" * 1000
+
+        mock_head_resp = MagicMock()
+        mock_head_resp.url = "https://cdn.gog.com/file.bin"
+        mock_head_resp.headers = {
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        }
+        mock_head_resp.raise_for_status = MagicMock()
+
+        call_count = [0]
+
+        def mock_get(url, headers=None, stream=None, timeout=None, cookies=None):
+            resp = MagicMock()
+            rng = headers.get("Range", "")
+            parts = rng.replace("bytes=", "").split("-")
+            start, end = int(parts[0]), int(parts[1])
+            call_count[0] += 1
+            # First range succeeds, second fails
+            if start == 0:
+                resp.status_code = 206
+                resp.iter_content = MagicMock(return_value=[data[start : end + 1]])
+            else:
+                raise ConnectionError("Network down")
+            return resp
+
+        dl.stop_request = threading.Event()
+        dl.MIN_CHUNK_SIZE = 100
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head_resp):
+            with patch.object(dl._parallel_session, "get", side_effect=mock_get):
+                dl.RETRY_ATTEMPTS = 1  # Don't retry in test
+                dl.async_download()
+
+        # Download should have failed
+        assert dl.state == dl.ERROR
+        # But progress file should exist with completed range
+        progress = DownloadProgress(dest)
+        assert progress.load() is True
+        # At least the first range should be recorded
+        assert len(progress.completed_ranges) >= 1
+
+
+class TestResumeFromProgress:
+    """Test resuming downloads from existing progress files."""
+
+    def _make_head_resp(self, url, file_size):
+        resp = MagicMock()
+        resp.url = url
+        resp.headers = {
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        }
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_resume_downloads_only_remaining_ranges(self, tmp_path):
+        """Resume should only download ranges not yet completed."""
+        dest = str(tmp_path / "resume.bin")
+        file_size = 4000
+        data = b"A" * 1000 + b"B" * 1000 + b"C" * 1000 + b"D" * 1000
+
+        # Pre-create destination file (simulating a previous partial download)
+        with open(dest, "wb") as f:
+            f.truncate(file_size)
+            # Write the first two ranges
+            f.seek(0)
+            f.write(data[0:1000])
+            f.seek(1000)
+            f.write(data[1000:2000])
+
+        # Pre-create progress file showing ranges 0-1 complete
+        progress = DownloadProgress(dest)
+        all_ranges = [(0, 999), (1000, 1999), (2000, 2999), (3000, 3999)]
+        progress.create("https://cdn.gog.com/file.bin", file_size, all_ranges)
+        progress.mark_range_complete(0, 999)
+        progress.mark_range_complete(1000, 1999)
+
+        # Now create a downloader that should resume
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=4)
+        dl.MIN_CHUNK_SIZE = 100
+        dl.stop_request = threading.Event()
+
+        downloaded_ranges = []
+
+        def mock_get(url, headers=None, stream=None, timeout=None, cookies=None):
+            resp = MagicMock()
+            rng = headers.get("Range", "")
+            parts = rng.replace("bytes=", "").split("-")
+            start, end = int(parts[0]), int(parts[1])
+            downloaded_ranges.append((start, end))
+            resp.status_code = 206
+            resp.iter_content = MagicMock(return_value=[data[start : end + 1]])
+            return resp
+
+        mock_head = self._make_head_resp("https://cdn.gog.com/file.bin", file_size)
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head):
+            with patch.object(dl._parallel_session, "get", side_effect=mock_get):
+                dl.async_download()
+
+        assert dl.state == dl.COMPLETED
+        # Only ranges 2 and 3 should have been downloaded
+        assert (0, 999) not in downloaded_ranges
+        assert (1000, 1999) not in downloaded_ranges
+        assert (2000, 2999) in downloaded_ranges
+        assert (3000, 3999) in downloaded_ranges
+
+        # File should be complete
+        with open(dest, "rb") as f:
+            result = f.read()
+        assert result == data
+
+        # Progress file should be cleaned up
+        assert not os.path.exists(dest + ".progress")
+
+    def test_resume_credits_already_downloaded_bytes(self, tmp_path):
+        """Resume should credit bytes from completed ranges to downloaded_size."""
+        dest = str(tmp_path / "credit.bin")
+        file_size = 2000
+
+        with open(dest, "wb") as f:
+            f.truncate(file_size)
+            f.write(b"X" * 1000)
+
+        progress = DownloadProgress(dest)
+        progress.create("https://cdn.gog.com/file.bin", file_size, [(0, 999), (1000, 1999)])
+        progress.mark_range_complete(0, 999)
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=2)
+        dl.MIN_CHUNK_SIZE = 100
+        dl.stop_request = threading.Event()
+
+        def mock_get(url, headers=None, stream=None, timeout=None, cookies=None):
+            resp = MagicMock()
+            rng = headers.get("Range", "")
+            parts = rng.replace("bytes=", "").split("-")
+            start, end = int(parts[0]), int(parts[1])
+            resp.status_code = 206
+            resp.iter_content = MagicMock(return_value=[b"Y" * (end - start + 1)])
+            return resp
+
+        mock_head = self._make_head_resp("https://cdn.gog.com/file.bin", file_size)
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head):
+            with patch.object(dl._parallel_session, "get", side_effect=mock_get):
+                dl.async_download()
+
+        assert dl.state == dl.COMPLETED
+        # Total downloaded = 1000 (already on disk) + 1000 (newly downloaded)
+        assert dl.downloaded_size == 2000
+
+    def test_resume_with_incompatible_file_size_starts_fresh(self, tmp_path):
+        """If file size changed, progress is discarded and we start fresh."""
+        dest = str(tmp_path / "incompat.bin")
+        old_size = 3000
+
+        with open(dest, "wb") as f:
+            f.truncate(old_size)
+
+        # Create progress with old file size
+        progress = DownloadProgress(dest)
+        progress.create("https://cdn.gog.com/file.bin", old_size, [(0, 2999)])
+        progress.mark_range_complete(0, 2999)
+
+        new_size = 4000  # File size changed on server
+        data = b"N" * new_size
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=2)
+        dl.MIN_CHUNK_SIZE = 100
+        dl.stop_request = threading.Event()
+
+        def mock_get(url, headers=None, stream=None, timeout=None, cookies=None):
+            resp = MagicMock()
+            rng = headers.get("Range", "")
+            parts = rng.replace("bytes=", "").split("-")
+            start, end = int(parts[0]), int(parts[1])
+            resp.status_code = 206
+            resp.iter_content = MagicMock(return_value=[data[start : end + 1]])
+            return resp
+
+        mock_head = self._make_head_resp("https://cdn.gog.com/file.bin", new_size)
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head):
+            with patch.object(dl._parallel_session, "get", side_effect=mock_get):
+                dl.async_download()
+
+        assert dl.state == dl.COMPLETED
+        assert dl.downloaded_size == new_size
+
+    def test_resume_with_missing_dest_starts_fresh(self, tmp_path):
+        """If dest file is gone but progress exists, start fresh."""
+        dest = str(tmp_path / "missing.bin")
+        file_size = 2000
+
+        # Create progress without the actual file
+        progress = DownloadProgress(dest)
+        progress.create("https://cdn.gog.com/file.bin", file_size, [(0, 999), (1000, 1999)])
+        progress.mark_range_complete(0, 999)
+
+        data = b"F" * file_size
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=2)
+        dl.MIN_CHUNK_SIZE = 100
+        dl.stop_request = threading.Event()
+
+        def mock_get(url, headers=None, stream=None, timeout=None, cookies=None):
+            resp = MagicMock()
+            rng = headers.get("Range", "")
+            parts = rng.replace("bytes=", "").split("-")
+            start, end = int(parts[0]), int(parts[1])
+            resp.status_code = 206
+            resp.iter_content = MagicMock(return_value=[data[start : end + 1]])
+            return resp
+
+        mock_head = self._make_head_resp("https://cdn.gog.com/file.bin", file_size)
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head):
+            with patch.object(dl._parallel_session, "get", side_effect=mock_get):
+                dl.async_download()
+
+        assert dl.state == dl.COMPLETED
+        # Fresh download, should have downloaded full size
+        assert dl.downloaded_size == file_size
+
+    def test_resume_skips_when_all_ranges_already_done(self, tmp_path):
+        """If all ranges complete and file exists, skip download entirely."""
+        dest = str(tmp_path / "skip.bin")
+        file_size = 2000
+        data = b"D" * file_size
+
+        with open(dest, "wb") as f:
+            f.write(data)
+
+        progress = DownloadProgress(dest)
+        progress.create("https://cdn.gog.com/file.bin", file_size, [(0, 999), (1000, 1999)])
+        progress.mark_range_complete(0, 999)
+        progress.mark_range_complete(1000, 1999)
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, num_workers=2)
+        dl.MIN_CHUNK_SIZE = 100
+        dl.stop_request = threading.Event()
+
+        mock_head = self._make_head_resp("https://cdn.gog.com/file.bin", file_size)
+
+        with patch.object(dl._parallel_session, "head", return_value=mock_head):
+            with patch.object(dl._parallel_session, "get") as get_mock:
+                dl.async_download()
+
+        assert dl.state == dl.COMPLETED
+        assert dl.downloaded_size == file_size
+        # GET should not have been called — all ranges already done
+        get_mock.assert_not_called()
+        # Progress file should be cleaned up
+        assert not os.path.exists(dest + ".progress")
+
+
+class TestResumeStartMethod:
+    """Test that start() preserves files when resume is possible."""
+
+    def test_start_preserves_file_when_progress_exists(self, tmp_path):
+        """start() should not delete dest if resumable progress is found."""
+        dest = str(tmp_path / "preserve.bin")
+        data = b"P" * 1000
+
+        with open(dest, "wb") as f:
+            f.write(data)
+
+        progress = DownloadProgress(dest)
+        progress.create("https://cdn.gog.com/file.bin", 2000, [(0, 999), (1000, 1999)])
+        progress.mark_range_complete(0, 999)
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, overwrite=True, num_workers=2)
+
+        # Patch AsyncCall so start() doesn't actually launch a thread
+        with patch("lutris.util.gog_downloader.jobs.AsyncCall") as mock_async:
+            mock_thread = MagicMock()
+            mock_thread.stop_request = threading.Event()
+            mock_async.return_value = mock_thread
+            dl.start()
+
+        # File should still exist
+        assert os.path.isfile(dest)
+        with open(dest, "rb") as f:
+            assert f.read() == data
+
+    def test_start_deletes_file_when_no_progress(self, tmp_path):
+        """start() should delete dest if no resumable progress exists."""
+        dest = str(tmp_path / "delete.bin")
+        with open(dest, "wb") as f:
+            f.write(b"old data")
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest, overwrite=True, num_workers=2)
+
+        with patch("lutris.util.gog_downloader.jobs.AsyncCall") as mock_async:
+            mock_thread = MagicMock()
+            mock_thread.stop_request = threading.Event()
+            mock_async.return_value = mock_thread
+            dl.start()
+
+        assert not os.path.isfile(dest)
+
+
+class TestCancelCleansProgress:
+    """Test that cancel() removes progress files."""
+
+    def test_cancel_removes_progress_file(self, tmp_path):
+        dest = str(tmp_path / "cancel.bin")
+        with open(dest, "wb") as f:
+            f.write(b"data")
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest)
+        dl.stop_request = threading.Event()
+
+        # Simulate active progress
+        dl._progress = DownloadProgress(dest)
+        dl._progress.create("https://cdn.gog.com/file.bin", 1000, [(0, 999)])
+
+        dl.cancel()
+
+        assert not os.path.isfile(dest)
+        assert not os.path.exists(dest + ".progress")
+        assert dl._progress is None
+
+    def test_cancel_without_progress(self, tmp_path):
+        """Cancel should work even if no progress was created."""
+        dest = str(tmp_path / "nocancel.bin")
+        with open(dest, "wb") as f:
+            f.write(b"data")
+
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest)
+        dl.stop_request = threading.Event()
+        dl.cancel()
+
+        assert not os.path.isfile(dest)
+
+
+class TestCompletionCleansProgress:
+    """Test that on_download_completed() removes progress files."""
+
+    def test_completed_removes_progress(self, tmp_path):
+        dest = str(tmp_path / "done.bin")
+        dl = GOGDownloader("https://cdn.gog.com/file.bin", dest)
+        dl.downloaded_size = 1000
+        dl.full_size = 1000
+
+        dl._progress = DownloadProgress(dest)
+        dl._progress.create("https://cdn.gog.com/file.bin", 1000, [(0, 999)])
+        dl._progress.mark_range_complete(0, 999)
+
+        dl.on_download_completed()
+
+        assert dl.state == dl.COMPLETED
+        assert not os.path.exists(dest + ".progress")
+        assert dl._progress is None
