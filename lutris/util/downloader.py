@@ -16,6 +16,12 @@ from lutris.util.log import logger
 # download speeds.
 get_time = time.monotonic
 
+# Default chunk size for downloads (512KB).
+# Previously 8KB which caused excessive syscall overhead.
+# 512KB matches heroic-gogdl and provides good throughput
+# while keeping memory usage reasonable.
+DEFAULT_CHUNK_SIZE = 1024 * 512  # 512KB
+
 
 class Downloader:
     """Non-blocking downloader.
@@ -35,6 +41,8 @@ class Downloader:
         referer: Optional[str] = None,
         cookies: Any = None,
         headers: Dict[str, str] = None,
+        session: Optional[requests.Session] = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
         self.url: str = url
         self.dest: str = dest
@@ -42,6 +50,8 @@ class Downloader:
         self.headers = headers
         self.overwrite: bool = overwrite
         self.referer = referer
+        self.session = session
+        self.chunk_size = chunk_size
         self.stop_request = None
         self.thread = None
 
@@ -143,13 +153,16 @@ class Downloader:
             if self.headers:
                 for key, value in self.headers.items():
                     headers[key] = value
-            response = requests.get(self.url, headers=headers, stream=True, timeout=30, cookies=self.cookies)
+
+            # Use provided session for connection pooling, or fall back to plain requests
+            requester = self.session if self.session else requests
+            response = requester.get(self.url, headers=headers, stream=True, timeout=30, cookies=self.cookies)
             if response.status_code != 200:
                 logger.info("%s returned a %s error", self.url, response.status_code)
             response.raise_for_status()
             self.full_size = int(response.headers.get("Content-Length", "").strip() or 0)
             self.progress_event.set()
-            for chunk in response.iter_content(chunk_size=8192):
+            for chunk in response.iter_content(chunk_size=self.chunk_size):
                 if not self.file_pointer:
                     break
                 if chunk:

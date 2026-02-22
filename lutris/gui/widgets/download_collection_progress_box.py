@@ -5,6 +5,7 @@ from gettext import gettext as _
 from gi.repository import GObject, Gtk, Pango
 
 from lutris.gui.dialogs import display_error
+from lutris.util.download_cache import CacheState, create_cache_lock, update_cache_lock
 from lutris.util.downloader import Downloader
 from lutris.util.jobs import schedule_repeating_at_idle
 from lutris.util.log import logger
@@ -134,6 +135,7 @@ class DownloadCollectionProgressBox(Gtk.Box):
                 self.emit("cancel")
                 return
 
+        create_cache_lock(file.dest_file, CacheState.DOWNLOADING)
         schedule_repeating_at_idle(self._progress, interval_seconds=0.5)
         self.cancel_button.show()
         self.cancel_button.set_sensitive(True)
@@ -199,6 +201,7 @@ class DownloadCollectionProgressBox(Gtk.Box):
             self.num_files_downloaded += 1
             self.current_size += self.downloader.downloaded_size
             os.rename(self._file_download.tmp_file, self._file_download.dest_file)
+            update_cache_lock(self._file_download.dest_file, CacheState.DOWNLOADED)
             # set file to None to get next one
             self._file_download = None
             self.downloader = None
