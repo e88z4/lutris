@@ -76,7 +76,7 @@ class DisplayManager:
             return ["%sx%s" % (DEFAULT_RESOLUTION_WIDTH, DEFAULT_RESOLUTION_HEIGHT)]
         return sorted(set(resolutions), key=lambda x: int(x.split("x")[0]), reverse=True)
 
-    def _get_primary_output(self) -> Optional[GnomeDesktop.RROutput]:
+    def _get_primary_output(self) -> "Optional[GnomeDesktop.RROutput]":
         """Return the RROutput used as a primary display"""
         for output in self.rr_screen.list_outputs():
             if output.get_is_primary():
